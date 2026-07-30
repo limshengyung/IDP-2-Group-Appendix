@@ -1,8 +1,9 @@
 % =========================================================================
-% MATLAB Script: SHM Pipeline (Ultimate Master Edition v11.0 - SMS Merged)
+% MATLAB Script: SHM Pipeline (Ultimate Master Edition v12.0 - Graph A Auto-Trim)
 % Features: 3-Axis Global / X-Axis Deep Dive / STFT / STA-LTA / Variance
 % INCLUDES: Full Educational FFTs + Dynamic Threshold Calibration + Hilbert Viz
 %           + SMS Alert Gateway (fires for ALL 3 payloads: 10kg, 8kg, 6kg)
+%           + Graph A auto-trim (blank/no-signal edges cropped, display only)
 % =========================================================================
 clear; clc; close all;
 %% ==========================================
@@ -163,6 +164,35 @@ function [pks, locs] = detectTriggerEvents(ratio, triggerOnLevel, triggerOffLeve
     pks = pks(:);
     locs = locs(:);
 end
+
+function [trimStart, trimEnd] = findActiveWindow(smoothTime, magSignal, threshFactor, padSec)
+% Finds the time window containing "real" signal activity by comparing a
+% smoothed envelope of magSignal against a robust quiet-baseline
+% estimate, then padding outward by padSec on each side.
+% This is used ONLY to set a plot's xlim (visual trim) - the underlying
+% data/filtering it's computed from is untouched, so no signal
+% processing changes as a result of calling this.
+
+    envelope = movmean(abs(magSignal), [10 10]); % light smoothing so single-sample spikes don't flicker the flag
+    quietBaseline = median(envelope(envelope <= prctile(envelope, 25)));
+    if quietBaseline == 0 || isnan(quietBaseline)
+        quietBaseline = prctile(envelope, 25);
+    end
+    threshold = quietBaseline * threshFactor;
+
+    activeIdx = find(envelope > threshold);
+    if isempty(activeIdx)
+        trimStart = smoothTime(1);
+        trimEnd   = smoothTime(end);
+        return;
+    end
+
+    trimStart = smoothTime(activeIdx(1))   - seconds(padSec);
+    trimEnd   = smoothTime(activeIdx(end)) + seconds(padSec);
+
+    if trimStart < smoothTime(1);   trimStart = smoothTime(1);   end
+    if trimEnd   > smoothTime(end); trimEnd   = smoothTime(end); end
+end
 %% ==========================================
 % ESP32 BUZZER GATEWAY CONFIGURATION
 % ==========================================
@@ -213,6 +243,9 @@ batchWindowSec = 10;
 targetLowCut   = 0.1; % Hz 
 PadFactor      = 10;  % FFT Zero-Padding Multiplier
 segsPerFig     = 3;   % How many segments to group per 3x3 figure
+trimThreshFactor = 5;   % Graph A auto-trim: multiple of quiet-baseline amplitude counted as "active"
+trimPadSec       = 3;   % Graph A auto-trim: seconds of REAL signal kept as padding around the active window
+zeroPadSec       = 2;   % Graph A auto-trim: extra BLANK margin added beyond that (pure visual whitespace, no data needed there)
 %% 1. Load the Dataset
 disp('Loading dataset...');
 data = readtable('sensor_data_8000.csv'); 
@@ -260,24 +293,37 @@ for setIdx = 1:numSets
     disp('Generating Continuous Graphs...');
     offset = setIdx * 30; 
     
+    % --- AUTO-TRIM: find the active (non-flat) time window for Graph A ---
+    sway_mag = sqrt(df.X.^2 + df.Y.^2 + df.Z.^2);
+    [trimStart, trimEnd] = findActiveWindow(df.SmoothTime, sway_mag, trimThreshFactor, trimPadSec);
+    trimStart = trimStart - seconds(zeroPadSec);   % extra blank margin, left side
+    trimEnd   = trimEnd   + seconds(zeroPadSec);   % extra blank margin, right side
+
     % --- GRAPH A: Full Timeline Data ---
-    figure('Name', sprintf('[%s] Graph A: Full Timeline', currentName), 'Position', [50+offset, 50+offset, 1000, 800]);
+    % Row 1: Raw Acceleration, FULL range (context)
+    % Row 2: Raw Acceleration, ZOOMED to the auto-detected active window (detail)
+    % Row 3: Filtered Sway, FULL range (matches Row 1's timeline)
+    figure('Name', sprintf('[%s] Graph A: Full Timeline', currentName), 'Position', [50+offset, 50+offset, 1000, 900]);
     sgtitle(sprintf('[%s] Full Timeline Data', currentName), 'FontWeight', 'bold');
+
     ax1 = subplot(3, 1, 1);
     plot(df.SmoothTime, df.Raw_X, 'Color', [0 0.45 0.74]); hold on; plot(df.SmoothTime, df.Raw_Y, 'Color', [0.85 0.33 0.10]); plot(df.SmoothTime, df.Raw_Z, 'Color', [0.47 0.67 0.19]); hold off;
-    title('Raw Acceleration'); ylabel('Amplitude'); 
+    title('Raw Acceleration (Full Timeline)'); ylabel('Amplitude'); 
     lgd = legend('X', 'Y', 'Z'); set(lgd, 'TextColor', 'w', 'Color', [0.15 0.15 0.15], 'EdgeColor', [0.3 0.3 0.3]);
     grid on; axis tight;
+
     ax2 = subplot(3, 1, 2);
-    plot(df.SmoothTime, df.X, 'Color', [0 0.45 0.74], 'LineWidth', 1.2); hold on; plot(df.SmoothTime, df.Y, 'Color', [0.85 0.33 0.10], 'LineWidth', 1.2); plot(df.SmoothTime, df.Z, 'Color', [0.47 0.67 0.19], 'LineWidth', 1.2); hold off;
-    title(sprintf('Filtered Sway (High-Pass > %.1f Hz)', targetLowCut)); ylabel('m/s^2'); grid on; axis tight;
-    for i = 1:length(uniqueBatches)
-        xline(df.SmoothTime(1) + seconds((i-1)*batchWindowSec), 'c--', 'LineWidth', 1.5, 'Alpha', 0.8); 
-    end
+    plot(df.SmoothTime, df.Raw_X, 'Color', [0 0.45 0.74]); hold on; plot(df.SmoothTime, df.Raw_Y, 'Color', [0.85 0.33 0.10]); plot(df.SmoothTime, df.Raw_Z, 'Color', [0.47 0.67 0.19]); hold off;
+    title('Raw Acceleration (Zoomed to Active Window)'); ylabel('Amplitude'); grid on; axis tight; xlim(ax2, [trimStart trimEnd]);
+
     ax3 = subplot(3, 1, 3);
-    plot(df.SmoothTime, df.SW420, 'Color', [0.93 0.69 0.13], 'LineWidth', 1.5);
-    title('SW-420 Trigger'); ylabel('Status'); ylim([-0.1, 1.2]); yticks([0 1]); yticklabels({'OFF', 'ON'}); grid on; axis tight;
-    linkaxes([ax1, ax2, ax3], 'x');
+    plot(df.SmoothTime, df.X, 'Color', [0 0.45 0.74], 'LineWidth', 1.2); hold on; plot(df.SmoothTime, df.Y, 'Color', [0.85 0.33 0.10], 'LineWidth', 1.2); plot(df.SmoothTime, df.Z, 'Color', [0.47 0.67 0.19], 'LineWidth', 1.2); hold off;
+    title(sprintf('Filtered Sway (High-Pass > %.1f Hz)', targetLowCut)); ylabel('m/s^2'); xlabel('Time'); grid on; axis tight;
+    for i = 1:length(uniqueBatches)
+        xline(ax3, df.SmoothTime(1) + seconds((i-1)*batchWindowSec), 'c--', 'LineWidth', 1.5, 'Alpha', 0.8); 
+    end
+
+    linkaxes([ax1, ax3], 'x');   % link the two FULL-range plots together; ax2 (zoomed) is intentionally independent
     
     % --- GRAPH B: Separated Raw Acceleration ---
     figure('Name', sprintf('[%s] Graph B: Raw', currentName), 'Position', [70+offset, 70+offset, 1000, 800]);
@@ -383,9 +429,16 @@ fprintf('\n======================================================\n');
 disp('Initiating Overall Analysis & One-by-One Generation...');
 fprintf('======================================================\n');
 
-% 1. Create the GENERAL overview figure first
-fig_general = figure('Name', 'GENERAL: FFT 3x3 Overall Comparison', 'Position', [20, 20, 1600, 900]);
-sgtitle('GENERAL VIEW: High-Resolution Normalized FFT Comparison', 'FontWeight', 'bold', 'FontSize', 16);
+% 1. Create TWO overview figures - one for weight-based sets, one for RPM-based sets
+%    (auto-detected by name so this still works if numSets/dataset order changes later)
+weightSetIdx = find(~contains(datasetNames, 'RPM'));
+rpmSetIdx    = find(contains(datasetNames, 'RPM'));
+
+fig_weight = figure('Name', 'GENERAL: FFT 3x3 Weight Comparison', 'Position', [20, 20, 1000, 900]);
+sgtitle('GENERAL VIEW: High-Resolution Normalized FFT Comparison (Weight Sets)', 'FontWeight', 'bold', 'FontSize', 16);
+
+fig_rpm = figure('Name', 'GENERAL: FFT 3x3 RPM Comparison', 'Position', [1050, 20, 1000, 900]);
+sgtitle('GENERAL VIEW: High-Resolution Normalized FFT Comparison (RPM Sets)', 'FontWeight', 'bold', 'FontSize', 16);
 
 globalPeaksX = zeros(numSets,1); 
 
@@ -439,24 +492,33 @@ for k = 1:numSets
     end
     
     % ============================================================
-    % PLOT 1: Add to the GENERAL 3x3 Figure
+    % PLOT 1: Add to the correct 3x3 Figure (Weight group or RPM group)
     % ============================================================
-    figure(fig_general); % Command MATLAB to focus on the 3x3 general figure
+    if ismember(k, weightSetIdx)
+        figure(fig_weight);
+        groupIdx  = weightSetIdx;
+        colPos    = find(weightSetIdx == k);
+    else
+        figure(fig_rpm);
+        groupIdx  = rpmSetIdx;
+        colPos    = find(rpmSetIdx == k);
+    end
+    numCols = length(groupIdx);
     
-    subplot(3, numSets, k);
+    subplot(3, numCols, colPos);
     plot(f_c, P1_X, 'Color', [0 0.45 0.74], 'LineWidth', 1.5); hold on; plot(freqX, maxX, 'rv', 'MarkerFaceColor', 'r'); 
     text(freqX + 0.2, maxX, sprintf('%.2f Hz', freqX), 'Color', 'r', 'FontWeight', 'bold'); hold off;
-    title(sprintf('%s\nX-Axis', datasetNames{k})); ylabel('Norm. Amplitude'); grid on; xlim([0, 15]); ylim([0, max(maxX*1.2, 0.1)]);
+    title(sprintf('%s\nX-Axis', datasetNames{k})); ylabel('Norm. Amplitude'); grid on; xlim([0, 15]); ylim([0, max(maxX*1.2, 1e-4)]);
     
-    subplot(3, numSets, k+numSets);
+    subplot(3, numCols, colPos+numCols);
     plot(f_c, P1_Y, 'Color', [0.85 0.33 0.10], 'LineWidth', 1.5); hold on; plot(freqY, maxY, 'rv', 'MarkerFaceColor', 'r');
     text(freqY + 0.2, maxY, sprintf('%.2f Hz', freqY), 'Color', 'r', 'FontWeight', 'bold'); hold off;
-    title('Y-Axis'); ylabel('Norm. Amplitude'); grid on; xlim([0, 15]); ylim([0, max(maxY*1.2, 0.1)]);
+    title('Y-Axis'); ylabel('Norm. Amplitude'); grid on; xlim([0, 15]); ylim([0, max(maxY*1.2, 1e-4)]);
     
-    subplot(3, numSets, k+2*numSets);
+    subplot(3, numCols, colPos+2*numCols);
     plot(f_c, P1_Z, 'Color', [0.47 0.67 0.19], 'LineWidth', 1.5); hold on; plot(freqZ, maxZ, 'rv', 'MarkerFaceColor', 'r');
     text(freqZ + 0.2, maxZ, sprintf('%.2f Hz', freqZ), 'Color', 'r', 'FontWeight', 'bold'); hold off;
-    title('Z-Axis'); xlabel('Frequency (Hz)'); ylabel('Norm. Amplitude'); grid on; xlim([0, 15]); ylim([0, max(maxZ*1.2, 0.1)]);
+    title('Z-Axis'); xlabel('Frequency (Hz)'); ylabel('Norm. Amplitude'); grid on; xlim([0, 15]); ylim([0, max(maxZ*1.2, 1e-4)]);
 
     % ============================================================
     % PLOT 2: Generate the ONE-BY-ONE Detailed Figure
@@ -663,19 +725,19 @@ for k = 1:numSets
     plot(f_norm, P1_X, 'Color', [0 0.45 0.74], 'LineWidth', 1.2); hold on; 
     plot(freqX, maxX, 'rv', 'MarkerFaceColor', 'r'); 
     text(freqX + 0.2, maxX, sprintf('%.2f Hz', freqX), 'Color', 'r', 'FontWeight', 'bold'); hold off;
-    title(sprintf('%s\nX-Axis', datasetNames{k})); ylabel('Norm. Amplitude'); grid on; xlim([0, 15]); ylim([0, max(maxX*1.2, 0.1)]);
+    title(sprintf('%s\nX-Axis', datasetNames{k})); ylabel('Norm. Amplitude'); grid on; xlim([0, 15]); ylim([0, max(maxX*1.2, 1e-4)]);
     
     subplot(3, numSets, k+numSets);
     plot(f_norm, P1_Y, 'Color', [0.85 0.33 0.10], 'LineWidth', 1.2); hold on; 
     plot(freqY, maxY, 'rv', 'MarkerFaceColor', 'r');
     text(freqY + 0.2, maxY, sprintf('%.2f Hz', freqY), 'Color', 'r', 'FontWeight', 'bold'); hold off;
-    title('Y-Axis'); ylabel('Norm. Amplitude'); grid on; xlim([0, 15]); ylim([0, max(maxY*1.2, 0.1)]);
+    title('Y-Axis'); ylabel('Norm. Amplitude'); grid on; xlim([0, 15]); ylim([0, max(maxY*1.2, 1e-4)]);
     
     subplot(3, numSets, k+2*numSets);
     plot(f_norm, P1_Z, 'Color', [0.47 0.67 0.19], 'LineWidth', 1.2); hold on; 
     plot(freqZ, maxZ, 'rv', 'MarkerFaceColor', 'r');
     text(freqZ + 0.2, maxZ, sprintf('%.2f Hz', freqZ), 'Color', 'r', 'FontWeight', 'bold'); hold off;
-    title('Z-Axis'); xlabel('Frequency (Hz)'); ylabel('Norm. Amplitude'); grid on; xlim([0, 15]); ylim([0, max(maxZ*1.2, 0.1)]);
+    title('Z-Axis'); xlabel('Frequency (Hz)'); ylabel('Norm. Amplitude'); grid on; xlim([0, 15]); ylim([0, max(maxZ*1.2, 1e-4)]);
 end
 %% =========================================================================
 % PART 6A: X-AXIS MULTI-RESOLUTION SEGMENTATION & STA/LTA (HILBERT) + SMS
